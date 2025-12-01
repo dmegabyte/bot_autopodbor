@@ -1,11 +1,13 @@
 import asyncio
 import logging
 import os
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import requests
 from dotenv import load_dotenv
 from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
@@ -13,6 +15,7 @@ from telegram import (
 )
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ConversationHandler,
     ContextTypes,
@@ -24,7 +27,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
 # States
-PHONE, BRAND, MODEL, CITY, YEAR_TO, BUDGET = range(6)
+PHONE, BRAND, MODEL, CITY, YEAR_TO, BUDGET, MANAGER, CLIENT_NAME = range(8)
 
 # Popular options for 2025 market reality based on spreadsheet (2015-2025)
 CAR_BRANDS = [
@@ -47,10 +50,75 @@ POPULAR_MODELS = {
 
 DEFAULT_MODEL_SUGGESTIONS = ["Lada Granta", "Haval Jolion", "Chery Tiggo 7 Pro"]
 
+MANAGER_DECISION_KEYBOARD = [
+    ["Да, передать менеджеру"],
+    ["Нет, пока не нужно"],
+]
+
+MANAGER_FOLLOWUP_BUTTON = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("Передать заявку менеджеру", callback_data="pass_manager")]]
+)
+
 SHEET_SYNC_URL = os.getenv(
     "SHEET_SYNC_URL",
     "https://script.google.com/macros/s/AKfycbxkA7StolIG29wpoe26bM2Q1ZOasmbvZbQqxHJhoTWaUNbYG5HlTekVlviTaCab4ce2/exec",
 )
+
+LAST_SYNC_KEY = "_last_synced_payload"
+
+
+def normalize_phone_number(raw_phone: Optional[str]) -> str:
+    """Return cleaned phone number with only digits prefixed by '+'."""
+    if not raw_phone:
+        return ""
+    digits = "".join(ch for ch in raw_phone if ch.isdigit())
+    if not digits:
+        return ""
+    return f"+{digits}"
+
+
+def _compose_full_name(first_name: Optional[str], last_name: Optional[str]) -> str:
+    """Join first/last name if present."""
+    parts = [part for part in (first_name, last_name) if part]
+    return " ".join(parts).strip()
+
+
+def maybe_set_client_name_from_profile(user_data: Dict) -> None:
+    """Fill client_name from available Telegram/contact data if missing."""
+    if user_data.get("client_name"):
+        return
+
+    candidates = [
+        _compose_full_name(user_data.get("contact_first_name"), user_data.get("contact_last_name")),
+        _compose_full_name(user_data.get("tg_first_name"), user_data.get("tg_last_name")),
+        user_data.get("tg_username"),
+    ]
+    for candidate in candidates:
+        if candidate:
+            user_data["client_name"] = candidate
+            return
+
+
+def remember_user_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Persist visible Telegram user attributes for later syncing."""
+    user = update.effective_user
+    if not user:
+        return
+
+    user_data = context.user_data
+    user_data["tg_user_id"] = user.id
+
+    if user.username:
+        username = user.username if user.username.startswith("@") else f"@{user.username}"
+        user_data["tg_username"] = username
+        user_data.setdefault("client_login", username)
+
+    if user.first_name:
+        user_data["tg_first_name"] = user.first_name
+    if user.last_name:
+        user_data["tg_last_name"] = user.last_name
+
+    maybe_set_client_name_from_profile(user_data)
 
 
 def _build_sync_payload(user_data: Dict) -> Dict:
@@ -62,6 +130,15 @@ def _build_sync_payload(user_data: Dict) -> Dict:
         "city": user_data.get("city"),
         "year": user_data.get("year_to"),
         "budget": user_data.get("budget"),
+        "tg_user_id": user_data.get("tg_user_id"),
+        "tg_username": user_data.get("tg_username"),
+        "tg_first_name": user_data.get("tg_first_name"),
+        "tg_last_name": user_data.get("tg_last_name"),
+        "contact_first_name": user_data.get("contact_first_name"),
+        "contact_last_name": user_data.get("contact_last_name"),
+        "client_name": user_data.get("client_name"),
+        "client_login": user_data.get("client_login"),
+        "manager": user_data.get("manager"),
     }
     return {k: v for k, v in payload.items() if v not in (None, "", 0)}
 
@@ -75,6 +152,12 @@ async def sync_progress(user_data: Dict) -> None:
     if not payload:
         return
 
+    last_payload = user_data.get(LAST_SYNC_KEY)
+    if last_payload == payload:
+        return
+    # Store a shallow copy so further modifications don't mutate cached payload
+    user_data[LAST_SYNC_KEY] = payload.copy()
+
     loop = asyncio.get_running_loop()
 
     def _do_request() -> None:
@@ -86,6 +169,36 @@ async def sync_progress(user_data: Dict) -> None:
     await loop.run_in_executor(None, _do_request)
 
 
+async def send_summary_message(message, user_data: Dict) -> None:
+    """Send summary of collected data to the user."""
+    phone = user_data.get("phone", "-")
+    client_name = user_data.get("client_name", "-")
+    login = user_data.get("client_login") or user_data.get("tg_username") or "-"
+    brand = user_data.get("brand", "-")
+    model = user_data.get("model", "-")
+    city = user_data.get("city", "-")
+    year_to = user_data.get("year_to", "-")
+    budget = user_data.get("budget", "-")
+
+    if isinstance(budget, int):
+        budget_value = f"{budget:,} ₽"
+    else:
+        budget_value = budget
+
+    summary = (
+        "??????! ??? ??? ? ????????:\n"
+        f"- ??? ???????: {client_name}\n"
+        f"- ???????: {phone}\n"
+        f"- ?????: {login}\n"
+        f"- ?????: {brand}\n"
+        f"- ??????: {model}\n"
+        f"- ?????: {city}\n"
+        f"- ???????????? ??? ???????: {year_to}\n"
+        f"- ??????: {budget_value}\n\n"
+        "???? ????? ???-?? ???????? - ?????? ????????, ? ?????? ??????."
+    )
+    await message.reply_text(summary)
+
 def build_model_keyboard(brand: str) -> ReplyKeyboardMarkup:
     """Return keyboard with the most popular models for the selected brand."""
     models: List[str] = POPULAR_MODELS.get(brand, DEFAULT_MODEL_SUGGESTIONS)
@@ -94,37 +207,158 @@ def build_model_keyboard(brand: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start conversation and ask for phone number."""
-    keyboard = [[KeyboardButton("📱 Отправить контакт", request_contact=True)]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+async def prompt_brand_selection(message, phone: str) -> int:
+    """Send prompt for brand selection when phone is known."""
+    await message.reply_text(
+ "Теперь выбери марку, которую рассматриваешь. Я оставил самые популярные варианты на 2025 год.",
+        reply_markup=ReplyKeyboardMarkup(CAR_BRANDS, resize_keyboard=True, one_time_keyboard=True),
+    )
+    return BRAND
 
+
+async def finalize_manager_handoff(message, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Send final confirmation when manager takes over."""
+    maybe_set_client_name_from_profile(context.user_data)
+    await sync_progress(context.user_data)
+
+    client_name = context.user_data.get("client_name") or context.user_data.get("tg_username") or "Коллега"
+    await message.reply_text(
+        f"{client_name}, передаю заявку менеджеру. Он свяжется в ближайшее время.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await send_summary_message(message, context.user_data)
+    return ConversationHandler.END
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start conversation. Phone is expected via deeplink parameter."""
+    remember_user_profile(update, context)
+    raw_argument: Optional[str] = context.args[0] if context.args else None
+    if not raw_argument and update.message and update.message.text:
+        parts = update.message.text.split(maxsplit=1)
+        if len(parts) > 1:
+            raw_argument = parts[1]
+
+    phone = normalize_phone_number(raw_argument)
+    if phone:
+        context.user_data["phone"] = phone
+        await sync_progress(context.user_data)
+        return await prompt_brand_selection(update.message, phone)
+
+    keyboard = [[KeyboardButton("📱 Поделиться номером", request_contact=True)]]
     await update.message.reply_text(
-        "Привет! Помогу с подбором авто.\n\n"
-        "Нажми кнопку ниже и поделись номером телефона, чтобы я мог держать связь.",
-        reply_markup=reply_markup,
+        "Для работы бота пожалуйста нажмите на кнопку ниже, чтобы поделиться номером телефона.",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
     )
     return PHONE
 
 
 async def phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Process phone number and move to brand selection."""
-    if not update.message.contact:
+    contact = update.message.contact
+    phone_raw: Optional[str] = None
+
+    if contact:
+        remember_user_profile(update, context)
+        if contact.first_name:
+            context.user_data["contact_first_name"] = contact.first_name
+        if contact.last_name:
+            context.user_data["contact_last_name"] = contact.last_name
+        phone_raw = contact.phone_number
+    else:
+        text = (update.message.text or "").strip()
+        phone_raw = text
+
+    phone = normalize_phone_number(phone_raw)
+    if not phone:
         await update.message.reply_text(
-            "Чтобы продолжить, отправь контакт через кнопку. Так я точно получу правильный номер."
+            "Не получилось прочитать номер. Нажмите кнопку «📱 Поделиться номером» или отправьте цифры одним сообщением."
         )
         return PHONE
 
-    phone = update.message.contact.phone_number
+    remember_user_profile(update, context)
     context.user_data["phone"] = phone
     await sync_progress(context.user_data)
 
+    return await prompt_brand_selection(update.message, phone)
+
+
+async def manager_consent_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle consent to pass contact to manager or keep request on hold."""
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text(
+            "Ответьте «Да, передать менеджеру» или «Нет, пока не нужно».",
+            reply_markup=ReplyKeyboardMarkup(
+                MANAGER_DECISION_KEYBOARD, resize_keyboard=True, one_time_keyboard=True
+            ),
+        )
+        return MANAGER
+
+    normalized = text.casefold()
+    if normalized.startswith("да") or "передать" in normalized:
+        context.user_data["manager"] = "true"
+        maybe_set_client_name_from_profile(context.user_data)
+        if context.user_data.get("client_name"):
+            return await finalize_manager_handoff(update.message, context)
+        await sync_progress(context.user_data)
+        await update.message.reply_text(
+            "Передаю контакт менеджеру - он скоро свяжется. Как к вам обращаться?",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return CLIENT_NAME
+
+    if normalized.startswith("нет") or "пока" in normalized:
+        context.user_data["manager"] = "false"
+        await sync_progress(context.user_data)
+        await update.message.reply_text(
+            "Спасибо за обратную связь. Заявка остаётся активной — вы сможете передать её менеджеру в любой момент.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await update.message.reply_text(
+            "Как только будете готовы, нажмите кнопку ниже.",
+            reply_markup=MANAGER_FOLLOWUP_BUTTON,
+        )
+        await send_summary_message(update.message, context.user_data)
+        return MANAGER
+
     await update.message.reply_text(
-        f"Отлично, записал номер {phone}.\n\n"
-        "Выбери марку, которую рассматриваешь. Я оставил самые популярные варианты на 2025 год.",
-        reply_markup=ReplyKeyboardMarkup(CAR_BRANDS, resize_keyboard=True, one_time_keyboard=True),
+        "Ответьте «Да, передать менеджеру» или «Нет, пока не нужно».",
+        reply_markup=ReplyKeyboardMarkup(
+            MANAGER_DECISION_KEYBOARD, resize_keyboard=True, one_time_keyboard=True
+        ),
     )
-    return BRAND
+    return MANAGER
+
+
+async def client_name_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Record client's name and finalize conversation."""
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("Нужен хотя бы один символ, чтобы я мог обращаться по имени.")
+        return CLIENT_NAME
+
+    context.user_data["client_name"] = text
+    return await finalize_manager_handoff(update.message, context)
+
+
+async def handle_manager_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle inline button to pass request to manager later."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=None)
+
+    context.user_data["manager"] = "true"
+    maybe_set_client_name_from_profile(context.user_data)
+    if context.user_data.get("client_name"):
+        return await finalize_manager_handoff(query.message, context)
+
+    await sync_progress(context.user_data)
+    await query.message.reply_text(
+        "Передаю контакт менеджеру - он скоро свяжется. Как к вам обращаться?",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return CLIENT_NAME
 
 
 async def brand_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -202,7 +436,7 @@ async def year_to_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def budget_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Process budget and show summary."""
+    """Process budget and move to manager consent."""
     try:
         budget = int(update.message.text.replace(" ", "").replace(",", ""))
     except (AttributeError, ValueError):
@@ -212,24 +446,12 @@ async def budget_received(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data["budget"] = budget
     await sync_progress(context.user_data)
 
-    phone = context.user_data.get("phone", "—")
-    brand = context.user_data.get("brand", "—")
-    model = context.user_data.get("model", "—")
-    city = context.user_data.get("city", "—")
-    year_to = context.user_data.get("year_to", "—")
-
-    summary = (
-        "Готово! Вот что я запомнил:\n"
-        f"• Телефон: {phone}\n"
-        f"• Марка: {brand}\n"
-        f"• Модель: {model}\n"
-        f"• Город: {city}\n"
-        f"• Максимальный год выпуска: {year_to}\n"
-        f"• Бюджет: {budget:,} ₽\n\n"
-        "Дальше подключаю GPT, чтобы подсказать лучшие варианты. Если захочешь начать заново — набери /start."
+    await update.message.reply_text(
+        "Мы приняли в обработку вашу заявку, в ближайшее время будем готовы выслать актуальные данные по подборке.\n\n"
+        "Могу я передать ваш контакт менеджеру?",
+        reply_markup=ReplyKeyboardMarkup(MANAGER_DECISION_KEYBOARD, resize_keyboard=True, one_time_keyboard=True),
     )
-    await update.message.reply_text(summary)
-    return ConversationHandler.END
+    return MANAGER
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -253,12 +475,20 @@ def main() -> None:
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            PHONE: [MessageHandler(filters.CONTACT, phone_received)],
+            PHONE: [
+                MessageHandler(filters.CONTACT, phone_received),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, phone_received),
+            ],
             BRAND: [MessageHandler(filters.TEXT & ~filters.COMMAND, brand_selected)],
             MODEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, model_received)],
             CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, city_selected)],
             YEAR_TO: [MessageHandler(filters.TEXT & ~filters.COMMAND, year_to_received)],
             BUDGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, budget_received)],
+            MANAGER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, manager_consent_received),
+                CallbackQueryHandler(handle_manager_button, pattern="^pass_manager$"),
+            ],
+            CLIENT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, client_name_received)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
