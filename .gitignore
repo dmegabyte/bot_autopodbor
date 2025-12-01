@@ -1,0 +1,11 @@
+.env
+config.txt
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.db
+*.sqlite
+venv/
+env/
