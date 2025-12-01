@@ -11,6 +11,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
+    Message,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     Update,
@@ -77,6 +78,15 @@ def get_progress_bar(current_step: int, total_steps: int = 7) -> str:
     return f"📊 Прогресс: {filled}{empty} {percentage}% (Шаг {current_step}/{total_steps})"
 
 
+def build_loading_bar(step: int, total_steps: int) -> str:
+    """ASCII-панель загрузки для короткого ожидания ИИ менеджера."""
+    step = max(0, min(step, total_steps))
+    filled = "=" * step
+    empty = "." * (total_steps - step)
+    percentage = int((step / total_steps) * 100) if total_steps else 0
+    return f"[{filled}{empty}] {percentage}%"
+
+
 def normalize_phone_number(raw_phone: Optional[str]) -> str:
     """Return cleaned phone number with only digits (no '+' prefix)."""
     if not raw_phone:
@@ -88,13 +98,27 @@ def normalize_phone_number(raw_phone: Optional[str]) -> str:
 
 
 def maybe_set_client_name_from_profile(user_data: Dict) -> None:
-    """Fill client_name from Telegram username if missing."""
+    """Fill client_name from Telegram profile/contact if missing."""
     if user_data.get("client_name"):
         return
 
-    # Используем только username
-    if user_data.get("tg_username"):
-        user_data["client_name"] = user_data["tg_username"]
+    def _join_name(first: Optional[str], last: Optional[str]) -> Optional[str]:
+        parts = [part.strip() for part in (first, last) if part and part.strip()]
+        return " ".join(parts) if parts else None
+
+    candidates: List[Optional[str]] = [
+        user_data.get("contact_full_name"),
+        _join_name(user_data.get("contact_first_name"), user_data.get("contact_last_name")),
+        user_data.get("tg_full_name"),
+        _join_name(user_data.get("tg_first_name"), user_data.get("tg_last_name")),
+        user_data.get("contact_first_name"),
+        user_data.get("tg_first_name"),
+    ]
+
+    for candidate in candidates:
+        if candidate:
+            user_data["client_name"] = candidate.strip()
+            return
 
 
 def remember_user_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -105,6 +129,14 @@ def remember_user_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     user_data = context.user_data
     user_data["tg_user_id"] = user.id
+
+    if user.first_name:
+        user_data["tg_first_name"] = user.first_name.strip()
+    if user.last_name:
+        user_data["tg_last_name"] = user.last_name.strip()
+    full_name = getattr(user, "full_name", None)
+    if full_name:
+        user_data["tg_full_name"] = full_name.strip()
 
     if user.username:
         username = user.username if user.username.startswith("@") else f"@{user.username}"
@@ -273,6 +305,39 @@ async def show_process_info(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return PHONE
 
 
+async def show_ai_selection_progress(message: Message, total_steps: int = 5) -> None:
+    """Показать короткий прогресс ожидания перед выдачей финальных предложений."""
+    header = (
+        "🤖 Ожидайте, наш ИИ-менеджер формирует актуальный список моделей.\n"
+        "Это займёт всего несколько секунд."
+    )
+
+    try:
+        progress_message = await message.reply_text(f"{header}\n{build_loading_bar(0, total_steps)}")
+    except Exception as exc:
+        logging.warning("Failed to send AI progress message: %s", exc)
+        await asyncio.sleep(total_steps)
+        return
+
+    for step in range(1, total_steps + 1):
+        await asyncio.sleep(1)
+        bar = build_loading_bar(step, total_steps)
+        try:
+            await progress_message.edit_text(f"{header}\n{bar}")
+        except Exception as exc:
+            logging.warning("Failed to update AI progress message: %s", exc)
+            return
+
+    final_text = (
+        "🤖 Подбор готов! Обновил список свежих предложений.\n"
+        f"{build_loading_bar(total_steps, total_steps)}"
+    )
+    try:
+        await progress_message.edit_text(final_text)
+    except Exception as exc:
+        logging.warning("Failed to finalize AI progress message: %s", exc)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start conversation. Phone is expected via deeplink parameter."""
     remember_user_profile(update, context)
@@ -318,6 +383,15 @@ async def phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if contact:
         remember_user_profile(update, context)
         phone_raw = contact.phone_number
+        user_data = context.user_data
+        if contact.first_name:
+            user_data["contact_first_name"] = contact.first_name.strip()
+        if contact.last_name:
+            user_data["contact_last_name"] = contact.last_name.strip()
+        name_parts = [part.strip() for part in (contact.first_name, contact.last_name) if part and part.strip()]
+        if name_parts:
+            user_data["contact_full_name"] = " ".join(name_parts)
+        maybe_set_client_name_from_profile(user_data)
     else:
         text = (update.message.text or "").strip()
         phone_raw = text
@@ -532,16 +606,27 @@ async def budget_received(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     sync_progress(context.user_data)
 
     progress = get_progress_bar(7)
-    message_text = (
+    waiting_message = (
         f"{progress}\n\n"
-        "✅ <b>Завершение</b>\n\n"
-        "Ваша заявка принята! В ближайшее время подготовим актуальные варианты.\n\n"
-        "Могу ли я передать ваш контакт менеджеру для персонального сопровождения?"
+        "🤖 <b>Шаг 7: Проверяем подбор</b>\n\n"
+        "Ожидайте, наш ИИ-менеджер формирует актуальный список моделей под ваш запрос."
     )
 
     await update.message.reply_text(
-        message_text,
+        waiting_message,
         parse_mode='HTML',
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+    await show_ai_selection_progress(update.message)
+
+    final_prompt = (
+        "Есть актуальные предложения по вашему запросу. "
+        "Передать контакт менеджеру, чтобы он связался и рассказал детали лично?"
+    )
+
+    await update.message.reply_text(
+        final_prompt,
         reply_markup=ReplyKeyboardMarkup(MANAGER_DECISION_KEYBOARD, resize_keyboard=True, one_time_keyboard=True),
     )
     return MANAGER
