@@ -1,6 +1,8 @@
 import asyncio
+import json
 import logging
 import os
+import threading
 from typing import Dict, List, Optional
 
 import requests
@@ -67,36 +69,32 @@ SHEET_SYNC_URL = os.getenv(
 LAST_SYNC_KEY = "_last_synced_payload"
 
 
+def get_progress_bar(current_step: int, total_steps: int = 7) -> str:
+    """Генерирует текстовый прогресс-бар для отображения этапа заполнения анкеты."""
+    filled = "▰" * current_step
+    empty = "▱" * (total_steps - current_step)
+    percentage = int((current_step / total_steps) * 100)
+    return f"📊 Прогресс: {filled}{empty} {percentage}% (Шаг {current_step}/{total_steps})"
+
+
 def normalize_phone_number(raw_phone: Optional[str]) -> str:
-    """Return cleaned phone number with only digits prefixed by '+'."""
+    """Return cleaned phone number with only digits (no '+' prefix)."""
     if not raw_phone:
         return ""
     digits = "".join(ch for ch in raw_phone if ch.isdigit())
     if not digits:
         return ""
-    return f"+{digits}"
-
-
-def _compose_full_name(first_name: Optional[str], last_name: Optional[str]) -> str:
-    """Join first/last name if present."""
-    parts = [part for part in (first_name, last_name) if part]
-    return " ".join(parts).strip()
+    return digits
 
 
 def maybe_set_client_name_from_profile(user_data: Dict) -> None:
-    """Fill client_name from available Telegram/contact data if missing."""
+    """Fill client_name from Telegram username if missing."""
     if user_data.get("client_name"):
         return
 
-    candidates = [
-        _compose_full_name(user_data.get("contact_first_name"), user_data.get("contact_last_name")),
-        _compose_full_name(user_data.get("tg_first_name"), user_data.get("tg_last_name")),
-        user_data.get("tg_username"),
-    ]
-    for candidate in candidates:
-        if candidate:
-            user_data["client_name"] = candidate
-            return
+    # Используем только username
+    if user_data.get("tg_username"):
+        user_data["client_name"] = user_data["tg_username"]
 
 
 def remember_user_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -113,11 +111,6 @@ def remember_user_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         user_data["tg_username"] = username
         user_data.setdefault("client_login", username)
 
-    if user.first_name:
-        user_data["tg_first_name"] = user.first_name
-    if user.last_name:
-        user_data["tg_last_name"] = user.last_name
-
     maybe_set_client_name_from_profile(user_data)
 
 
@@ -132,41 +125,60 @@ def _build_sync_payload(user_data: Dict) -> Dict:
         "budget": user_data.get("budget"),
         "tg_user_id": user_data.get("tg_user_id"),
         "tg_username": user_data.get("tg_username"),
-        "tg_first_name": user_data.get("tg_first_name"),
-        "tg_last_name": user_data.get("tg_last_name"),
-        "contact_first_name": user_data.get("contact_first_name"),
-        "contact_last_name": user_data.get("contact_last_name"),
         "client_name": user_data.get("client_name"),
         "client_login": user_data.get("client_login"),
         "manager": user_data.get("manager"),
     }
-    return {k: v for k, v in payload.items() if v not in (None, "", 0)}
+    logging.info(f"Payload before filtering: {payload}")
+    filtered = {k: v for k, v in payload.items() if v not in (None, "", 0)}
+    logging.info(f"Payload after filtering: {filtered}")
+    return filtered
 
 
-async def sync_progress(user_data: Dict) -> None:
-    """Send incremental updates to Google Sheet whenever new data appears."""
+def sync_progress(user_data: Dict) -> None:
+    """Send incremental updates to Google Sheet in background (non-blocking).
+
+    This function now runs synchronously in a background task to avoid blocking
+    the bot's responses to users. The actual request is made without awaiting.
+    """
+    logging.info(f"sync_progress called. SHEET_SYNC_URL={bool(SHEET_SYNC_URL)}, phone={user_data.get('phone')}")
+
     if not SHEET_SYNC_URL or not user_data.get("phone"):
+        logging.warning("Sync skipped: missing URL or phone")
         return
 
     payload = _build_sync_payload(user_data)
+    logging.info(f"Payload built: {payload}")
+
     if not payload:
+        logging.warning("Sync skipped: empty payload")
         return
 
     last_payload = user_data.get(LAST_SYNC_KEY)
     if last_payload == payload:
+        logging.info("Sync skipped: payload unchanged")
         return
     # Store a shallow copy so further modifications don't mutate cached payload
     user_data[LAST_SYNC_KEY] = payload.copy()
 
-    loop = asyncio.get_running_loop()
-
+    # Launch sync in background thread without blocking
     def _do_request() -> None:
         try:
-            requests.get(SHEET_SYNC_URL, params=payload, timeout=10)
+            # Отправляем POST запрос с JSON в теле для корректной передачи кириллицы
+            headers = {'Content-Type': 'application/json; charset=utf-8'}
+            response = requests.post(
+                SHEET_SYNC_URL,
+                data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+                headers=headers,
+                timeout=10
+            )
+            logging.info("Synced to sheet: %s", payload)
         except requests.RequestException as exc:
             logging.warning("Failed to sync with sheet: %s", exc)
 
-    await loop.run_in_executor(None, _do_request)
+    # Run in background thread without awaiting
+    thread = threading.Thread(target=_do_request, daemon=True)
+    thread.start()
 
 
 async def send_summary_message(message, user_data: Dict) -> None:
@@ -186,16 +198,15 @@ async def send_summary_message(message, user_data: Dict) -> None:
         budget_value = budget
 
     summary = (
-        "??????! ??? ??? ? ????????:\n"
-        f"- ??? ???????: {client_name}\n"
-        f"- ???????: {phone}\n"
-        f"- ?????: {login}\n"
-        f"- ?????: {brand}\n"
-        f"- ??????: {model}\n"
-        f"- ?????: {city}\n"
-        f"- ???????????? ??? ???????: {year_to}\n"
-        f"- ??????: {budget_value}\n\n"
-        "???? ????? ???-?? ???????? - ?????? ????????, ? ?????? ??????."
+        f"- Ваш контакт: {client_name}\n"
+        f"- Телефон: {phone}\n"
+        f"- Логин: {login}\n"
+        f"- Марка: {brand}\n"
+        f"- Модель: {model}\n"
+        f"- Город: {city}\n"
+        f"- Максимальный год выпуска: {year_to}\n"
+        f"- Бюджет: {budget_value}\n\n"
+
     )
     await message.reply_text(summary)
 
@@ -209,8 +220,16 @@ def build_model_keyboard(brand: str) -> ReplyKeyboardMarkup:
 
 async def prompt_brand_selection(message, phone: str) -> int:
     """Send prompt for brand selection when phone is known."""
+    progress = get_progress_bar(2)
+    message_text = (
+        f"{progress}\n\n"
+        "🚗 <b>Шаг 2: Марка автомобиля</b>\n\n"
+        "Выберите марку, которую вы рассматриваете. "
+        "Представлены самые популярные варианты 2025 года."
+    )
     await message.reply_text(
- "Теперь выбери марку, которую рассматриваешь. Я оставил самые популярные варианты на 2025 год.",
+        message_text,
+        parse_mode='HTML',
         reply_markup=ReplyKeyboardMarkup(CAR_BRANDS, resize_keyboard=True, one_time_keyboard=True),
     )
     return BRAND
@@ -219,7 +238,7 @@ async def prompt_brand_selection(message, phone: str) -> int:
 async def finalize_manager_handoff(message, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Send final confirmation when manager takes over."""
     maybe_set_client_name_from_profile(context.user_data)
-    await sync_progress(context.user_data)
+    sync_progress(context.user_data)
 
     client_name = context.user_data.get("client_name") or context.user_data.get("tg_username") or "Коллега"
     await message.reply_text(
@@ -228,6 +247,30 @@ async def finalize_manager_handoff(message, context: ContextTypes.DEFAULT_TYPE) 
     )
     await send_summary_message(message, context.user_data)
     return ConversationHandler.END
+
+
+async def show_process_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Показать подробную информацию о процессе подбора."""
+    info_message = (
+        "📋 <b>Как работает ИИ Автоподборщик</b>\n\n"
+        "1️⃣ Собираем ваши предпочтения (марка, модель, бюджет)\n"
+        "2️⃣ ИИ анализирует актуальные предложения на рынке\n"
+        "3️⃣ Формируем персональную подборку\n"
+        "4️⃣ Менеджер связывается с вами с готовыми вариантами\n\n"
+        "⏱️ <b>Время обработки</b>: 1-2 часа\n"
+        "💼 <b>Эксперты</b>: Опытные менеджеры по автоподбору\n"
+        "🎯 <b>Результат</b>: 3-5 лучших вариантов под ваши требования\n\n"
+        "Готовы начать?"
+    )
+
+    keyboard = [[KeyboardButton("🚀 Начать подбор", request_contact=True)]]
+
+    await update.message.reply_text(
+        info_message,
+        parse_mode='HTML',
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
+    )
+    return PHONE
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -242,12 +285,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     phone = normalize_phone_number(raw_argument)
     if phone:
         context.user_data["phone"] = phone
-        await sync_progress(context.user_data)
+        sync_progress(context.user_data)
         return await prompt_brand_selection(update.message, phone)
 
-    keyboard = [[KeyboardButton("📱 Поделиться номером", request_contact=True)]]
+    greeting = (
+        "🤖 <b>Добро пожаловать в ИИ Автоподборщик</b>\n\n"
+        "Я помогу вам найти идеальный автомобиль, учитывая ваши предпочтения и бюджет. "
+        "Для получения актуальных предложений потребуется собрать короткую анкету.\n\n"
+        "📋 Это займёт всего 2-3 минуты\n"
+        "✅ Экономия времени на поиске\n"
+        "💰 Подбор по вашему бюджету"
+    )
+
+    keyboard = [
+        [KeyboardButton("🚀 Быстрый старт", request_contact=True)],
+        [KeyboardButton("ℹ️ Подробнее о процессе")]
+    ]
+
     await update.message.reply_text(
-        "Для работы бота пожалуйста нажмите на кнопку ниже, чтобы поделиться номером телефона.",
+        greeting,
+        parse_mode='HTML',
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
     )
     return PHONE
@@ -260,10 +317,6 @@ async def phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if contact:
         remember_user_profile(update, context)
-        if contact.first_name:
-            context.user_data["contact_first_name"] = contact.first_name
-        if contact.last_name:
-            context.user_data["contact_last_name"] = contact.last_name
         phone_raw = contact.phone_number
     else:
         text = (update.message.text or "").strip()
@@ -278,7 +331,7 @@ async def phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     remember_user_profile(update, context)
     context.user_data["phone"] = phone
-    await sync_progress(context.user_data)
+    sync_progress(context.user_data)
 
     return await prompt_brand_selection(update.message, phone)
 
@@ -301,7 +354,7 @@ async def manager_consent_received(update: Update, context: ContextTypes.DEFAULT
         maybe_set_client_name_from_profile(context.user_data)
         if context.user_data.get("client_name"):
             return await finalize_manager_handoff(update.message, context)
-        await sync_progress(context.user_data)
+        sync_progress(context.user_data)
         await update.message.reply_text(
             "Передаю контакт менеджеру - он скоро свяжется. Как к вам обращаться?",
             reply_markup=ReplyKeyboardRemove(),
@@ -310,7 +363,7 @@ async def manager_consent_received(update: Update, context: ContextTypes.DEFAULT
 
     if normalized.startswith("нет") or "пока" in normalized:
         context.user_data["manager"] = "false"
-        await sync_progress(context.user_data)
+        sync_progress(context.user_data)
         await update.message.reply_text(
             "Спасибо за обратную связь. Заявка остаётся активной — вы сможете передать её менеджеру в любой момент.",
             reply_markup=ReplyKeyboardRemove(),
@@ -353,7 +406,7 @@ async def handle_manager_button(update: Update, context: ContextTypes.DEFAULT_TY
     if context.user_data.get("client_name"):
         return await finalize_manager_handoff(query.message, context)
 
-    await sync_progress(context.user_data)
+    sync_progress(context.user_data)
     await query.message.reply_text(
         "Передаю контакт менеджеру - он скоро свяжется. Как к вам обращаться?",
         reply_markup=ReplyKeyboardRemove(),
@@ -366,15 +419,20 @@ async def brand_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     brand = update.message.text.strip()
     context.user_data["brand"] = brand
     popular_models = POPULAR_MODELS.get(brand, DEFAULT_MODEL_SUGGESTIONS)
-    await sync_progress(context.user_data)
+    sync_progress(context.user_data)
+
+    progress = get_progress_bar(3)
+    message_text = (
+        f"{progress}\n\n"
+        f"✨ <b>Шаг 3: Модель {brand}</b>\n\n"
+        "Укажите конкретную модель. Можно выбрать из популярных вариантов или написать свою.\n\n"
+        f"🔝 Самые популярные модели {brand}: {', '.join(popular_models)}"
+    )
 
     await update.message.reply_text(
-        f"Принято, работаем с {brand}.\n\n"
-        "Подскажи модель. Можно выбрать подсвеченные популярные варианты или написать свою.",
+        message_text,
+        parse_mode='HTML',
         reply_markup=build_model_keyboard(brand),
-    )
-    await update.message.reply_text(
-        f"Самые популярные модели {brand} сейчас: {', '.join(popular_models)}."
     )
     return MODEL
 
@@ -391,10 +449,19 @@ async def model_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return MODEL
 
     context.user_data["model"] = text
-    await sync_progress(context.user_data)
+    sync_progress(context.user_data)
+
+    progress = get_progress_bar(4)
+    message_text = (
+        f"{progress}\n\n"
+        "🏙️ <b>Шаг 4: Город</b>\n\n"
+        "В каком городе будем подбирать автомобиль? "
+        "Это поможет найти актуальные предложения в вашем регионе."
+    )
 
     await update.message.reply_text(
-        "В каком городе будем подбирать автомобиль?",
+        message_text,
+        parse_mode='HTML',
         reply_markup=ReplyKeyboardMarkup(CITIES, resize_keyboard=True, one_time_keyboard=True),
     )
     return CITY
@@ -404,11 +471,20 @@ async def city_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     """Process city selection and move to year selection."""
     city = update.message.text.strip()
     context.user_data["city"] = city
-    await sync_progress(context.user_data)
+    logging.info(f"City selected: {city}, user_data now: {context.user_data}")
+    sync_progress(context.user_data)
+
+    progress = get_progress_bar(5)
+    message_text = (
+        f"{progress}\n\n"
+        "📅 <b>Шаг 5: Год выпуска</b>\n\n"
+        "Укажите максимальный год выпуска («до» какого года рассматриваете). "
+        "Например: 2020"
+    )
 
     await update.message.reply_text(
-        "Принято. Теперь введи максимальный год выпуска (\"до\" какого года рассматриваешь). "
-        "Например: 2013.",
+        message_text,
+        parse_mode='HTML',
         reply_markup=ReplyKeyboardRemove(),
     )
     return YEAR_TO
@@ -427,10 +503,19 @@ async def year_to_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return YEAR_TO
 
     context.user_data["year_to"] = year_to
-    await sync_progress(context.user_data)
+    sync_progress(context.user_data)
+
+    progress = get_progress_bar(6)
+    message_text = (
+        f"{progress}\n\n"
+        "💰 <b>Шаг 6: Бюджет</b>\n\n"
+        "Укажите комфортный бюджет в рублях. "
+        "Это позволит подобрать оптимальные варианты. Например: 1500000"
+    )
 
     await update.message.reply_text(
-        "Отлично. Осталось понять комфортный бюджет. Напиши сумму в рублях, например 1500000."
+        message_text,
+        parse_mode='HTML'
     )
     return BUDGET
 
@@ -444,11 +529,19 @@ async def budget_received(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return BUDGET
 
     context.user_data["budget"] = budget
-    await sync_progress(context.user_data)
+    sync_progress(context.user_data)
+
+    progress = get_progress_bar(7)
+    message_text = (
+        f"{progress}\n\n"
+        "✅ <b>Завершение</b>\n\n"
+        "Ваша заявка принята! В ближайшее время подготовим актуальные варианты.\n\n"
+        "Могу ли я передать ваш контакт менеджеру для персонального сопровождения?"
+    )
 
     await update.message.reply_text(
-        "Мы приняли в обработку вашу заявку, в ближайшее время будем готовы выслать актуальные данные по подборке.\n\n"
-        "Могу я передать ваш контакт менеджеру?",
+        message_text,
+        parse_mode='HTML',
         reply_markup=ReplyKeyboardMarkup(MANAGER_DECISION_KEYBOARD, resize_keyboard=True, one_time_keyboard=True),
     )
     return MANAGER
@@ -470,13 +563,23 @@ def main() -> None:
         print("Error: BOT_TOKEN not found in .env file")
         return
 
-    application = Application.builder().token(token).build()
+    application = (
+        Application.builder()
+        .token(token)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .pool_timeout(10.0)
+        .build()
+    )
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
             PHONE: [
                 MessageHandler(filters.CONTACT, phone_received),
+                MessageHandler(filters.Regex("^ℹ️ Подробнее о процессе$"), show_process_info),
+                MessageHandler(filters.Regex("^🚀 (Быстрый старт|Начать подбор)$"), phone_received),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, phone_received),
             ],
             BRAND: [MessageHandler(filters.TEXT & ~filters.COMMAND, brand_selected)],
