@@ -160,6 +160,7 @@ def _build_sync_payload(user_data: Dict) -> Dict:
         "client_name": user_data.get("client_name"),
         "client_login": user_data.get("client_login"),
         "manager": user_data.get("manager"),
+        "tag": user_data.get("tag"),
     }
     logging.info(f"Payload before filtering: {payload}")
     filtered = {k: v for k, v in payload.items() if v not in (None, "", 0)}
@@ -339,19 +340,21 @@ async def show_ai_selection_progress(message: Message, total_steps: int = 5) -> 
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start conversation. Phone is expected via deeplink parameter."""
+    """Start conversation. Tag is expected via deeplink parameter."""
     remember_user_profile(update, context)
+
+    # Extract tag from deeplink
     raw_argument: Optional[str] = context.args[0] if context.args else None
     if not raw_argument and update.message and update.message.text:
         parts = update.message.text.split(maxsplit=1)
         if len(parts) > 1:
             raw_argument = parts[1]
 
-    phone = normalize_phone_number(raw_argument)
-    if phone:
-        context.user_data["phone"] = phone
+    # Save tag if present
+    if raw_argument:
+        context.user_data["tag"] = raw_argument
+        # Write tag to Google Sheets immediately (incremental sync)
         sync_progress(context.user_data)
-        return await prompt_brand_selection(update.message, phone)
 
     greeting = (
         "🤖 <b>Добро пожаловать в ИИ Автоподборщик</b>\n\n"
