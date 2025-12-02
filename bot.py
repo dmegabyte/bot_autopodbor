@@ -379,38 +379,55 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Process phone number and move to brand selection."""
+    """Process phone number from contact share."""
     contact = update.message.contact
-    phone_raw: Optional[str] = None
 
-    if contact:
-        remember_user_profile(update, context)
-        phone_raw = contact.phone_number
-        user_data = context.user_data
-        if contact.first_name:
-            user_data["contact_first_name"] = contact.first_name.strip()
-        if contact.last_name:
-            user_data["contact_last_name"] = contact.last_name.strip()
-        name_parts = [part.strip() for part in (contact.first_name, contact.last_name) if part and part.strip()]
-        if name_parts:
-            user_data["contact_full_name"] = " ".join(name_parts)
-        maybe_set_client_name_from_profile(user_data)
-    else:
-        text = (update.message.text or "").strip()
-        phone_raw = text
-
-    phone = normalize_phone_number(phone_raw)
-    if not phone:
+    # Contact should always exist since handler requires filters.CONTACT
+    if not contact:
         await update.message.reply_text(
-            "Не получилось прочитать номер. Нажмите кнопку «📱 Поделиться номером» или отправьте цифры одним сообщением."
+            "Пожалуйста, поделитесь номером телефона через кнопку «🚀 Быстрый старт»."
         )
         return PHONE
 
     remember_user_profile(update, context)
+    phone_raw = contact.phone_number
+
+    # Extract name from contact
+    user_data = context.user_data
+    if contact.first_name:
+        user_data["contact_first_name"] = contact.first_name.strip()
+    if contact.last_name:
+        user_data["contact_last_name"] = contact.last_name.strip()
+    name_parts = [part.strip() for part in (contact.first_name, contact.last_name) if part and part.strip()]
+    if name_parts:
+        user_data["contact_full_name"] = " ".join(name_parts)
+    maybe_set_client_name_from_profile(user_data)
+
+    phone = normalize_phone_number(phone_raw)
+    if not phone:
+        await update.message.reply_text(
+            "Не удалось обработать номер телефона. Попробуйте еще раз."
+        )
+        return PHONE
+
     context.user_data["phone"] = phone
     sync_progress(context.user_data)
 
     return await prompt_brand_selection(update.message, phone)
+
+
+async def reject_text_phone_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Reject text input and require phone sharing via button."""
+    await update.message.reply_text(
+        "Для продолжения необходимо поделиться номером телефона.\n\n"
+        "Пожалуйста, нажмите кнопку «🚀 Быстрый старт» ниже, чтобы поделиться контактом.",
+        reply_markup=ReplyKeyboardMarkup(
+            [[KeyboardButton("🚀 Быстрый старт", request_contact=True)]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+    )
+    return PHONE
 
 
 async def manager_consent_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -667,8 +684,7 @@ def main() -> None:
             PHONE: [
                 MessageHandler(filters.CONTACT, phone_received),
                 MessageHandler(filters.Regex("^ℹ️ Подробнее о процессе$"), show_process_info),
-                MessageHandler(filters.Regex("^🚀 (Быстрый старт|Начать подбор)$"), phone_received),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, phone_received),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, reject_text_phone_input),
             ],
             BRAND: [MessageHandler(filters.TEXT & ~filters.COMMAND, brand_selected)],
             MODEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, model_received)],
