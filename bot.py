@@ -147,7 +147,13 @@ def remember_user_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 def _build_sync_payload(user_data: Dict) -> Dict:
-    """Prepare payload for Google Apps Script call."""
+    """Prepare payload for Google Apps Script call.
+
+    IMPORTANT: tg_user_id is ALWAYS included as it's the primary key for row lookup.
+    """
+    # tg_user_id is mandatory - it's our primary key for finding/updating rows
+    tg_user_id = user_data.get("tg_user_id")
+
     payload = {
         "phone": user_data.get("phone"),
         "brand": user_data.get("brand"),
@@ -155,7 +161,7 @@ def _build_sync_payload(user_data: Dict) -> Dict:
         "city": user_data.get("city"),
         "year": user_data.get("year_to"),
         "budget": user_data.get("budget"),
-        "tg_user_id": user_data.get("tg_user_id"),
+        "tg_user_id": tg_user_id,
         "tg_username": user_data.get("tg_username"),
         "client_name": user_data.get("client_name"),
         "client_login": user_data.get("client_login"),
@@ -163,7 +169,9 @@ def _build_sync_payload(user_data: Dict) -> Dict:
         "tag": user_data.get("tag"),
     }
     logging.info(f"Payload before filtering: {payload}")
-    filtered = {k: v for k, v in payload.items() if v not in (None, "", 0)}
+
+    # Filter out empty values BUT always keep tg_user_id (our primary key)
+    filtered = {k: v for k, v in payload.items() if v not in (None, "", 0) or k == "tg_user_id"}
     logging.info(f"Payload after filtering: {filtered}")
     return filtered
 
