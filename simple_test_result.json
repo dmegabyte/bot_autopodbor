@@ -1,0 +1,23 @@
+{
+  "status": "success",
+  "action": "created",
+  "phone": "79991234999",
+  "debug_received_data": {
+    "phone": "79991234999",
+    "brand": "Lada",
+    "model": "Vesta",
+    "city": "Москва",
+    "year": 2021,
+    "budget": 1800000,
+    "client_name": "Дмитрий Тестовый",
+    "manager": "true"
+  },
+  "debug_extracted": {
+    "city": "Москва",
+    "client_name": "Дмитрий Тестовый"
+  },
+  "debug_col_indexes": {
+    "city": 7,
+    "client_name": 8
+  }
+}

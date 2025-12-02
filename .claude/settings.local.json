@@ -4,7 +4,17 @@
       "Bash(python:*)",
       "Bash(pip install:*)",
       "Bash(timeout /t 3 /nobreak)",
-      "Bash(C:/Users/User/AppData/Local/Microsoft/WindowsApps/python3.11.exe -m pip install:*)"
+      "Bash(C:/Users/User/AppData/Local/Microsoft/WindowsApps/python3.11.exe -m pip install:*)",
+      "Bash(dir:*)",
+      "Bash(findstr:*)",
+      "Bash(C:/Users/User/AppData/Local/Microsoft/WindowsApps/python3.11.exe bot.py)",
+      "Bash(C:/Users/User/AppData/Local/Microsoft/WindowsApps/python3.11.exe test_sync.py)",
+      "Bash(C:/Users/User/AppData/Local/Microsoft/WindowsApps/python3.11.exe test_sync_advanced.py)",
+      "Bash(C:/Users/User/AppData/Local/Microsoft/WindowsApps/python3.11.exe:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git rm nul-)"
     ],
     "deny": [],
     "ask": []

@@ -1,0 +1,24 @@
+{
+  "status_code": 200,
+  "request_payload": {
+    "phone": "79991234568",
+    "brand": "Haval",
+    "model": "Jolion",
+    "city": "Санкт-Петербург",
+    "year": 2022,
+    "budget": 2500000
+  },
+  "response": {
+    "status": "success",
+    "action": "created",
+    "phone": "79991234568",
+    "debug_received_data": {
+      "phone": "79991234568",
+      "brand": "Haval",
+      "model": "Jolion",
+      "city": "Санкт-Петербург",
+      "year": 2022,
+      "budget": 2500000
+    }
+  }
+}
