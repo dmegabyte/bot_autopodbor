@@ -174,10 +174,15 @@ def sync_progress(user_data: Dict) -> None:
     This function now runs synchronously in a background task to avoid blocking
     the bot's responses to users. The actual request is made without awaiting.
     """
-    logging.info(f"sync_progress called. SHEET_SYNC_URL={bool(SHEET_SYNC_URL)}, phone={user_data.get('phone')}")
+    logging.info(f"sync_progress called. SHEET_SYNC_URL={bool(SHEET_SYNC_URL)}, phone={user_data.get('phone')}, tg_user_id={user_data.get('tg_user_id')}")
 
-    if not SHEET_SYNC_URL or not user_data.get("phone"):
-        logging.warning("Sync skipped: missing URL or phone")
+    # Require either phone or tg_user_id to identify the user
+    if not SHEET_SYNC_URL:
+        logging.warning("Sync skipped: missing SHEET_SYNC_URL")
+        return
+
+    if not user_data.get("phone") and not user_data.get("tg_user_id"):
+        logging.warning("Sync skipped: missing both phone and tg_user_id")
         return
 
     payload = _build_sync_payload(user_data)

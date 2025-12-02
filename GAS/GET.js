@@ -29,9 +29,9 @@ function processData(data) {
     var phone = normalizePhone(phoneRaw);
     var tgUserId = data.tg_user_id || data.user_id;
 
-    // Require either phone or tg_user_id for identification
-    if (!phone && !tgUserId) {
-      return responseJSON({ "status": "error", "message": "No phone or tg_user_id" });
+    // Require at least tg_user_id for identification (phone is optional initially)
+    if (!tgUserId) {
+      return responseJSON({ "status": "error", "message": "Missing tg_user_id (required for user identification)" });
     }
 
     // КАРТА ПОЛЕЙ
@@ -75,7 +75,7 @@ function processData(data) {
       }
     }
 
-    // ПОИСК: Priority 1 - by phone, Priority 2 - by tg_user_id
+    // ПОИСК: Priority 1 - by tg_user_id (always required), Priority 2 - by phone (as fallback)
     var rowIndex = -1;
     var phoneColIndex = colIndexes["phone_number"];
     var tgUserIdColIndex = colIndexes["tg_user_id"];
@@ -85,8 +85,14 @@ function processData(data) {
       var allData = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
 
       for (var i = 0; i < allData.length; i++) {
-        // Priority 1: Search by phone (if phone provided)
-        if (phone) {
+        // Priority 1: Search by tg_user_id (required identifier)
+        var cellTgId = String(allData[i][tgUserIdColIndex]);
+        if (cellTgId === String(tgUserId)) {
+          rowIndex = i + 2;
+          break;
+        }
+        // Priority 2: If not found by tg_user_id and phone is provided, try by phone
+        if (phone && rowIndex === -1) {
           var cellValue = allData[i][phoneColIndex];
           var normalizedCell = normalizePhone(cellValue);
           if (normalizedCell === phone) {
@@ -94,17 +100,9 @@ function processData(data) {
             break;
           }
         }
-        // Priority 2: Search by tg_user_id (if phone not provided)
-        else if (tgUserId) {
-          var cellTgId = String(allData[i][tgUserIdColIndex]);
-          if (cellTgId === String(tgUserId)) {
-            rowIndex = i + 2;
-            break;
-          }
-        }
       }
     }
-    Logger.log("Search phone: " + phone + ", tg_user_id: " + tgUserId + ", found at row: " + rowIndex);
+    Logger.log("Search tg_user_id: " + tgUserId + ", phone: " + phone + ", found at row: " + rowIndex);
 
     // ЗАПИСЬ
     var action = "";
