@@ -731,7 +731,10 @@ def main() -> None:
             ],
             CLIENT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, client_name_received)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("start", start),  # allow /start to restart from any state
+        ],
         allow_reentry=True,
     )
 
