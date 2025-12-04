@@ -1,7 +1,8 @@
-import asyncio
+﻿import asyncio
 import json
 import logging
 import os
+import re
 import threading
 from typing import Dict, List, Optional
 
@@ -31,6 +32,9 @@ logging.basicConfig(level=logging.INFO)
 
 # States
 PHONE, BRAND, MODEL, CITY, YEAR_TO, BUDGET, MANAGER, CLIENT_NAME = range(8)
+
+PHONE_SHARE_BUTTON_TEXT = "Передать номер"
+PROCESS_INFO_BUTTON_TEXT = "Как мы работаем"
 
 # Popular options for 2025 market reality based on spreadsheet (2015-2025)
 CAR_BRANDS = [
@@ -88,13 +92,25 @@ def build_loading_bar(step: int, total_steps: int) -> str:
 
 
 def normalize_phone_number(raw_phone: Optional[str]) -> str:
-    """Return cleaned phone number with only digits (no '+' prefix)."""
+    """Return cleaned Russian phone number (11 digits, starts with 7)."""
     if not raw_phone:
         return ""
-    digits = "".join(ch for ch in raw_phone if ch.isdigit())
+
+    digits = "".join(ch for ch in str(raw_phone) if ch.isdigit())
     if not digits:
         return ""
-    return digits
+
+    if len(digits) == 10:
+        digits = "7" + digits
+    elif len(digits) == 11:
+        if digits[0] == "8":
+            digits = "7" + digits[1:]
+        elif digits[0] != "7":
+            return ""
+    else:
+        return ""
+
+    return digits if digits.startswith("7") and len(digits) == 11 else ""
 
 
 def maybe_set_client_name_from_profile(user_data: Dict) -> None:
@@ -119,6 +135,14 @@ def maybe_set_client_name_from_profile(user_data: Dict) -> None:
         if candidate:
             user_data["client_name"] = candidate.strip()
             return
+
+
+def build_phone_keyboard(include_process_info: bool = False) -> ReplyKeyboardMarkup:
+    """Keyboard to request phone via contact button (optionally with info button)."""
+    rows = [[KeyboardButton(PHONE_SHARE_BUTTON_TEXT, request_contact=True)]]
+    if include_process_info:
+        rows.append([KeyboardButton(PROCESS_INFO_BUTTON_TEXT)])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
 
 
 def remember_user_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -298,23 +322,17 @@ async def finalize_manager_handoff(message, context: ContextTypes.DEFAULT_TYPE) 
 async def show_process_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Показать подробную информацию о процессе подбора."""
     info_message = (
-        "📋 <b>Как работает ИИ Автоподборщик</b>\n\n"
-        "1️⃣ Собираем ваши предпочтения (марка, модель, бюджет)\n"
-        "2️⃣ ИИ анализирует актуальные предложения на рынке\n"
-        "3️⃣ Формируем персональную подборку\n"
-        "4️⃣ Менеджер связывается с вами с готовыми вариантами\n\n"
-        "⏱️ <b>Время обработки</b>: 1-2 часа\n"
-        "💼 <b>Эксперты</b>: Опытные менеджеры по автоподбору\n"
-        "🎯 <b>Результат</b>: 3-5 лучших вариантов под ваши требования\n\n"
-        "Готовы начать?"
+        "Как мы работаем:\n\n"
+        "1) Собираем ваши требования (бренд, модель, бюджет).\n"
+        "2) Анализируем рынок и подбираем подходящие варианты.\n"
+        "3) Готовим подборку и связываемся для уточнений.\n\n"
+        "Время отклика: 1-2 часа. Готовы начать?"
     )
-
-    keyboard = [[KeyboardButton("🚀 Начать подбор", request_contact=True)]]
 
     await update.message.reply_text(
         info_message,
         parse_mode='HTML',
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
+        reply_markup=build_phone_keyboard(),
     )
     return PHONE
 
@@ -354,6 +372,7 @@ async def show_ai_selection_progress(message: Message, total_steps: int = 5) -> 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start conversation. Tag is expected via deeplink parameter."""
+    context.user_data.clear()
     remember_user_profile(update, context)
 
     # Extract tag from deeplink
@@ -370,23 +389,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         sync_progress(context.user_data)
 
     greeting = (
-        "🤖 <b>Добро пожаловать в ИИ Автоподборщик</b>\n\n"
-        "Я помогу вам найти идеальный автомобиль, учитывая ваши предпочтения и бюджет. "
-        "Для получения актуальных предложений потребуется собрать короткую анкету.\n\n"
-        "📋 Это займёт всего 2-3 минуты\n"
-        "✅ Экономия времени на поиске\n"
-        "💰 Подбор по вашему бюджету"
+        "Добро пожаловать в бота автоподбора!\n\n"
+        "Отправьте номер телефона РФ цифрами или нажмите кнопку \"Передать номер\". "
+        "Если хотите узнать, как мы работаем, нажмите \"Как мы работаем\". "
+        "Дальше зададим еще пару вопросов и передадим заявку.\n\n"
+        "Обычно процесс занимает 2-3 минуты\n"
+        "Нужен номер, чтобы связаться и вести заявку\n"
+        "Можно перезапустить диалог в любой момент командой /start"
     )
-
-    keyboard = [
-        [KeyboardButton("🚀 Быстрый старт", request_contact=True)],
-        [KeyboardButton("ℹ️ Подробнее о процессе")]
-    ]
 
     await update.message.reply_text(
         greeting,
         parse_mode='HTML',
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
+        reply_markup=build_phone_keyboard(include_process_info=True),
     )
     return PHONE
 
@@ -398,7 +413,8 @@ async def phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Contact should always exist since handler requires filters.CONTACT
     if not contact:
         await update.message.reply_text(
-            "Пожалуйста, поделитесь номером телефона через кнопку «🚀 Быстрый старт»."
+            "Нужен номер телефона. Нажмите \"Передать номер\" или отправьте его цифрами.",
+            reply_markup=build_phone_keyboard(),
         )
         return PHONE
 
@@ -419,7 +435,8 @@ async def phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     phone = normalize_phone_number(phone_raw)
     if not phone:
         await update.message.reply_text(
-            "Не удалось обработать номер телефона. Попробуйте еще раз."
+            "Не похоже на российский номер. Отправьте его цифрами или нажмите \"Передать номер\".",
+            reply_markup=build_phone_keyboard(),
         )
         return PHONE
 
@@ -429,18 +446,22 @@ async def phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return await prompt_brand_selection(update.message, phone)
 
 
-async def reject_text_phone_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Reject text input and require phone sharing via button."""
-    await update.message.reply_text(
-        "Для продолжения необходимо поделиться номером телефона.\n\n"
-        "Пожалуйста, нажмите кнопку «🚀 Быстрый старт» ниже, чтобы поделиться контактом.",
-        reply_markup=ReplyKeyboardMarkup(
-            [[KeyboardButton("🚀 Быстрый старт", request_contact=True)]],
-            resize_keyboard=True,
-            one_time_keyboard=True
+async def phone_received_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle phone numbers typed as plain text (fallback when no contact is shared)."""
+    remember_user_profile(update, context)
+    text = (update.message.text or "").strip()
+    phone = normalize_phone_number(text)
+    if not phone:
+        await update.message.reply_text(
+            "Пожалуйста, отправьте номер РФ (10-11 цифр) или нажмите \"Передать номер\".",
+            reply_markup=build_phone_keyboard(),
         )
-    )
-    return PHONE
+        return PHONE
+
+    context.user_data["phone"] = phone
+    maybe_set_client_name_from_profile(context.user_data)
+    sync_progress(context.user_data)
+    return await prompt_brand_selection(update.message, phone)
 
 
 async def manager_consent_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -696,8 +717,8 @@ def main() -> None:
         states={
             PHONE: [
                 MessageHandler(filters.CONTACT, phone_received),
-                MessageHandler(filters.Regex("^ℹ️ Подробнее о процессе$"), show_process_info),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, reject_text_phone_input),
+                MessageHandler(filters.Regex(f"^{re.escape(PROCESS_INFO_BUTTON_TEXT)}$"), show_process_info),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, phone_received_text),
             ],
             BRAND: [MessageHandler(filters.TEXT & ~filters.COMMAND, brand_selected)],
             MODEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, model_received)],
@@ -711,6 +732,7 @@ def main() -> None:
             CLIENT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, client_name_received)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
 
     application.add_handler(conv_handler)
